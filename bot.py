@@ -43,6 +43,7 @@ from telegram.ext import (
     filters,
 )
 import yt_dlp
+from instagram_downloader import download_instagram
 
 # Premium Emojis helper import
 from premium import get_emoji, get_emoji_id
@@ -669,116 +670,18 @@ def resolve_redirect_url(url: str) -> str:
     except Exception:
         return url
 
-# Instagram Photo & Carousel Post Downloader (Fallback for photo posts)
-def download_instagram_photo_post(url: str, output_path: str) -> dict:
-    """Download single photo or carousel photos from Instagram post."""
-    ydl = yt_dlp.YoutubeDL({"quiet": True})
-    ie = yt_dlp.extractor.instagram.InstagramIE(ydl)
-    video_id, clean_url = ie._match_valid_url(url).group("id", "url")
-    media_id = str(yt_dlp.extractor.instagram._id_to_pk(video_id))
-    ie._real_initialize()
-
-    csrf_token = ie._get_cookies("https://www.instagram.com").get("csrftoken")
-    csrf_val = csrf_token.value if csrf_token else None
-
-    response = ie._download_json(
-        "https://www.instagram.com/api/graphql",
-        video_id,
-        fatal=False,
-        impersonate=True,
-        headers={
-            **ie._api_headers,
-            "X-FB-Friendly-Name": "PolarisLoggedOutDesktopWWWPostRootContentQuery",
-            "X-CSRFToken": csrf_val,
-            "X-FB-LSD": ie._lsd_token,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": clean_url,
-        },
-        data=yt_dlp.extractor.instagram.urlencode_postdata({
-            "lsd": ie._lsd_token,
-            "fb_api_caller_class": "RelayModern",
-            "fb_api_req_friendly_name": "PolarisLoggedOutDesktopWWWPostRootContentQuery",
-            "server_timestamps": "true",
-            "variables": yt_dlp.utils.json.dumps({"media_id": media_id}, separators=(",", ":")),
-            "doc_id": "27130156389949648",
-        }),
-    )
-
-    media = yt_dlp.utils.traverse_obj(response, ("data", "xig_polaris_media", {dict}))
-    product_info = yt_dlp.utils.traverse_obj(media, ("if_not_gated_logged_out", {dict}))
-    if not product_info:
-        raise ValueError("This Instagram post is private or requires login authentication.")
-
-    info_dict = ie._extract_product(product_info, video_id=video_id, get_comments=False)
-    title = info_dict.get("title") or "Instagram Photo Post"
-    uploader = info_dict.get("uploader") or info_dict.get("channel") or "Instagram Creator"
-
-    carousel = yt_dlp.utils.traverse_obj(product_info, ("carousel_media", ..., {dict}))
-    image_urls = []
-
-    if carousel:
-        for item in carousel:
-            img_candidates = yt_dlp.utils.traverse_obj(item, ("image_versions2", "candidates", ..., {dict}))
-            if img_candidates:
-                best = max(img_candidates, key=lambda x: (x.get("width", 0) * x.get("height", 0)))
-                image_urls.append(best["url"])
-    else:
-        img_candidates = yt_dlp.utils.traverse_obj(product_info, ("image_versions2", "candidates", ..., {dict}))
-        if img_candidates:
-            best = max(img_candidates, key=lambda x: (x.get("width", 0) * x.get("height", 0)))
-            image_urls.append(best["url"])
-        elif info_dict.get("thumbnails"):
-            image_urls.append(info_dict["thumbnails"][-1]["url"])
-
-    if not image_urls:
-        raise ValueError("No images could be extracted from this Instagram post.")
-
-    # Download primary photo
-    req = urllib.request.Request(image_urls[0], headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=20) as resp, open(output_path, "wb") as f:
-        f.write(resp.read())
-
-    # Download additional carousel images (up to 9 more)
-    extra_paths = []
-    base_name, _ = os.path.splitext(output_path)
-    for idx, img_url in enumerate(image_urls[1:10], start=2):
-        extra_path = f"{base_name}_{idx}.jpg"
-        req = urllib.request.Request(img_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=20) as resp, open(extra_path, "wb") as f:
-            f.write(resp.read())
-        extra_paths.append(extra_path)
-
-    file_size = os.path.getsize(output_path)
-    for ep in extra_paths:
-        if os.path.exists(ep):
-            file_size += os.path.getsize(ep)
-
-    return {
-        "file_path": output_path,
-        "title": title,
-        "duration": None,
-        "uploader": uploader,
-        "filesize": file_size,
-        "width": None,
-        "height": None,
-        "extra_photos": extra_paths,
-        "is_photo": True,
-    }
-
 # Core Downloader Logic
 def download_media_sync(url: str, output_template: str) -> dict:
-    """Download video or photo synchronously with yt-dlp / Instagram resolver."""
+    """Download video or photo synchronously with yt-dlp or dedicated platform engines."""
     target_url = resolve_redirect_url(url)
-    is_instagram = "instagram.com" in target_url.lower()
 
-    format_selector = (
-        "best[ext=mp4]/best"
-        if is_instagram
-        else "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
-    )
+    # 1. Delegate Instagram downloads to dedicated Instagram engine
+    if "instagram.com" in target_url.lower():
+        return download_instagram(target_url, output_template)
 
+    # 2. Universal media downloader (YouTube, TikTok, Pinterest, X, Facebook, etc.)
     ydl_opts = {
-        "format": format_selector,
+        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "outtmpl": output_template,
         "max_filesize": MAX_FILESIZE_BYTES,
         "quiet": True,
@@ -805,79 +708,69 @@ def download_media_sync(url: str, output_template: str) -> dict:
     if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
         ydl_opts["ffmpeg_location"] = FFMPEG_PATH
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(target_url, download=True)
-            except Exception as e:
-                err_str = str(e).lower()
-                if is_instagram and ("no video" in err_str or "/p/" in target_url):
-                    photo_path = output_template.replace("%(ext)s", "jpg")
-                    return download_instagram_photo_post(target_url, photo_path)
-                is_yt = any(x in target_url.lower() for x in ["youtube.com", "youtu.be"])
-                if is_yt and any(term in err_str for term in ["player", "format", "sabr", "extract", "bot"]):
-                    logger.info(f"Retrying YouTube with fallback player clients: {e}")
-                    fallback_clients = [
-                        ["mweb", "android_creator", "ios"],
-                        ["tv", "android"],
-                        ["web_safari", "mweb"],
-                    ]
-                    last_yt_err = e
-                    info = None
-                    for client_set in fallback_clients:
-                        try:
-                            fb_opts = dict(ydl_opts)
-                            fb_opts["extractor_args"] = {"youtube": {"player_client": client_set}}
-                            with yt_dlp.YoutubeDL(fb_opts) as ydl_fb:
-                                info = ydl_fb.extract_info(target_url, download=True)
-                                if info:
-                                    break
-                        except Exception as fb_e:
-                            last_yt_err = fb_e
-                    if not info:
-                        if target_url != url:
-                            info = ydl.extract_info(url, download=True)
-                        else:
-                            raise last_yt_err
-                elif target_url != url:
-                    info = ydl.extract_info(url, download=True)
-                else:
-                    raise
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(target_url, download=True)
+        except Exception as e:
+            err_str = str(e).lower()
+            is_yt = any(x in target_url.lower() for x in ["youtube.com", "youtu.be"])
+            if is_yt and any(term in err_str for term in ["player", "format", "sabr", "extract", "bot"]):
+                logger.info(f"Retrying YouTube with fallback player clients: {e}")
+                fallback_clients = [
+                    ["mweb", "android_creator", "ios"],
+                    ["tv", "android"],
+                    ["web_safari", "mweb"],
+                ]
+                last_yt_err = e
+                info = None
+                for client_set in fallback_clients:
+                    try:
+                        fb_opts = dict(ydl_opts)
+                        fb_opts["extractor_args"] = {"youtube": {"player_client": client_set}}
+                        with yt_dlp.YoutubeDL(fb_opts) as ydl_fb:
+                            info = ydl_fb.extract_info(target_url, download=True)
+                            if info:
+                                break
+                    except Exception as fb_e:
+                        last_yt_err = fb_e
+                if not info:
+                    if target_url != url:
+                        info = ydl.extract_info(url, download=True)
+                    else:
+                        raise last_yt_err
+            elif target_url != url:
+                info = ydl.extract_info(url, download=True)
+            else:
+                raise
 
-            if "entries" in info and info["entries"]:
-                info = info["entries"][0]
+        if "entries" in info and info["entries"]:
+            info = info["entries"][0]
 
-            filename = ydl.prepare_filename(info)
-            if not os.path.exists(filename):
-                base, _ = os.path.splitext(filename)
-                for ext in [".mp4", ".mkv", ".webm", ".jpg", ".png"]:
-                    if os.path.exists(base + ext):
-                        filename = base + ext
-                        break
+        filename = ydl.prepare_filename(info)
+        if not os.path.exists(filename):
+            base, _ = os.path.splitext(filename)
+            for ext in [".mp4", ".mkv", ".webm", ".jpg", ".png"]:
+                if os.path.exists(base + ext):
+                    filename = base + ext
+                    break
 
-            # Verify audio stream & ensure Telegram AAC compatibility
-            has_audio, audio_codec = get_audio_info(filename)
-            if has_audio:
-                filename, has_audio = ensure_telegram_compatible_audio(filename)
+        # Verify audio stream & ensure Telegram AAC compatibility
+        has_audio, audio_codec = get_audio_info(filename)
+        if has_audio:
+            filename, has_audio = ensure_telegram_compatible_audio(filename)
 
-            return {
-                "file_path": filename,
-                "title": info.get("title", "Media Video"),
-                "duration": info.get("duration"),
-                "uploader": info.get("uploader", info.get("channel", "Creator")),
-                "filesize": info.get("filesize") or info.get("filesize_approx") or (os.path.getsize(filename) if os.path.exists(filename) else 0),
-                "width": info.get("width"),
-                "height": info.get("height"),
-                "is_photo": False,
-                "has_audio": has_audio,
-                "extra_photos": [],
-            }
-    except Exception as e:
-        err_str = str(e).lower()
-        if is_instagram and ("no video" in err_str or "/p/" in target_url):
-            photo_path = output_template.replace("%(ext)s", "jpg")
-            return download_instagram_photo_post(target_url, photo_path)
-        raise
+        return {
+            "file_path": filename,
+            "title": info.get("title", "Media Video"),
+            "duration": info.get("duration"),
+            "uploader": info.get("uploader", info.get("channel", "Creator")),
+            "filesize": info.get("filesize") or info.get("filesize_approx") or (os.path.getsize(filename) if os.path.exists(filename) else 0),
+            "width": info.get("width"),
+            "height": info.get("height"),
+            "is_photo": False,
+            "has_audio": has_audio,
+            "extra_photos": [],
+        }
 
 # Command: /start
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
