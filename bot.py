@@ -355,24 +355,55 @@ def is_admin(user_id: int) -> bool:
         return False
     return user_id in ADMIN_IDS
 
+def normalize_fsub_chat_id(channel_str: str):
+    """Normalize any channel link, @username, or numeric ID into a valid Telegram chat_id."""
+    if not channel_str:
+        return None
+    channel_str = channel_str.strip()
+    if channel_str.lstrip("-").isdigit():
+        return int(channel_str)
+    if "t.me/" in channel_str:
+        parts = channel_str.rstrip("/").split("t.me/")
+        if len(parts) > 1:
+            clean = parts[1].strip()
+            if not clean.startswith("+") and not clean.startswith("joinchat/"):
+                return f"@{clean.lstrip('@')}"
+    if not channel_str.startswith("@") and not channel_str.startswith("-"):
+        return f"@{channel_str}"
+    return channel_str
+
 async def is_subscribed(bot, user_id: int) -> bool:
     if not FSUB_CHANNEL:
         return True
     if is_admin(user_id):
         return True
+    
+    chat_id = normalize_fsub_chat_id(FSUB_CHANNEL)
+    if not chat_id:
+        return True
+
     try:
-        chat_id = int(FSUB_CHANNEL) if FSUB_CHANNEL.lstrip("-").isdigit() else FSUB_CHANNEL
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        return member.status in [
+        status = member.status
+        is_sub = status in [
             constants.ChatMemberStatus.MEMBER,
             constants.ChatMemberStatus.ADMINISTRATOR,
             constants.ChatMemberStatus.OWNER,
-        ]
+        ] or (status == constants.ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False))
+        
+        if not is_sub:
+            status_str = str(status).lower()
+            is_sub = any(valid in status_str for valid in ["member", "administrator", "creator", "owner"])
+            
+        return is_sub
     except telegram.error.BadRequest as e:
-        logger.warning(f"FSUB check BadRequest for user {user_id}: {e}")
+        err_msg = str(e).lower()
+        logger.warning(f"FSUB check BadRequest for user {user_id} on {chat_id}: {e}")
+        if "chat not found" in err_msg or "not enough rights" in err_msg or "bot is not a member" in err_msg:
+            logger.error(f"FSUB ERROR: Bot cannot access channel {chat_id}! Make sure channel username/ID is correct and bot is an Administrator: {e}")
         return False
     except Exception as e:
-        logger.warning(f"FSUB check error for user {user_id}: {e}")
+        logger.warning(f"FSUB check error for user {user_id} on {chat_id}: {e}")
         return False
 
 def get_fsub_keyboard() -> InlineKeyboardMarkup:
@@ -1395,6 +1426,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "verify_fsub":
         subscribed = await is_subscribed(context.bot, user_id)
+        if not subscribed:
+            await asyncio.sleep(0.5)
+            subscribed = await is_subscribed(context.bot, user_id)
+
         if subscribed:
             await query.answer("✅ Verification successful! Bot unlocked.", show_alert=True)
             bot_info = await context.bot.get_me()
