@@ -569,7 +569,7 @@ def download_media_sync(url: str, output_template: str) -> dict:
     is_instagram = "instagram.com" in target_url.lower()
 
     ydl_opts = {
-        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "format": "best[ext=mp4]/bestvideo+bestaudio/best",
         "outtmpl": output_template,
         "max_filesize": MAX_FILESIZE_BYTES,
         "quiet": True,
@@ -583,7 +583,7 @@ def download_media_sync(url: str, output_template: str) -> dict:
         },
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "web"]
+                "player_client": ["android", "ios"]
             }
         },
     }
@@ -600,7 +600,12 @@ def download_media_sync(url: str, output_template: str) -> dict:
                 if is_instagram and ("no video" in err_str or "/p/" in target_url):
                     photo_path = output_template.replace("%(ext)s", "jpg")
                     return download_instagram_photo_post(target_url, photo_path)
-                if target_url != url:
+                if any(x in target_url.lower() for x in ["youtube.com", "youtu.be"]) and ("player" in err_str or "format" in err_str):
+                    fallback_opts = dict(ydl_opts)
+                    fallback_opts["extractor_args"] = {"youtube": {"player_client": ["mweb", "android"]}}
+                    with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
+                        info = ydl_fb.extract_info(target_url, download=True)
+                elif target_url != url:
                     info = ydl.extract_info(url, download=True)
                 else:
                     raise
