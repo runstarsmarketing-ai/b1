@@ -126,11 +126,36 @@ async def safe_reply_audio(message, audio, caption: str, **kwargs):
             return await message.reply_audio(audio=audio, caption=clean_caption, **kwargs)
         raise
 
-# FFMPEG binary path
+# FFMPEG binary path resolution (Linux, Windows, macOS, Render, Docker)
+FFMPEG_PATH = None
 try:
-    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+    import shutil
+    # 1. First check if ffmpeg is in system PATH (e.g. /usr/bin/ffmpeg on Linux)
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg and os.path.exists(system_ffmpeg):
+        FFMPEG_PATH = system_ffmpeg
+    else:
+        # 2. Bundled imageio_ffmpeg binary
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and os.path.exists(bundled):
+            FFMPEG_PATH = bundled
+            if hasattr(os, "chmod"):
+                try:
+                    os.chmod(FFMPEG_PATH, 0o755)
+                except Exception:
+                    pass
 except Exception:
     FFMPEG_PATH = None
+
+# Inject FFmpeg directory into os.environ["PATH"] so yt-dlp finds it automatically
+if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
+    try:
+        ffmpeg_dir = str(Path(FFMPEG_PATH).parent)
+        current_path = os.environ.get("PATH", "")
+        if ffmpeg_dir not in current_path:
+            os.environ["PATH"] = f"{ffmpeg_dir}{os.pathsep}{current_path}"
+    except Exception:
+        pass
 
 def extract_audio_mp3_sync(video_path: str, mp3_path: str) -> bool:
     """Extract audio track as MP3 using FFmpeg."""
@@ -166,10 +191,11 @@ def extract_audio_mp3_sync(video_path: str, mp3_path: str) -> bool:
 def get_audio_info(filepath: str) -> tuple[bool, str]:
     """Check if a media file contains an audio stream, and return (has_audio, codec_name)."""
     if not FFMPEG_PATH or not os.path.exists(FFMPEG_PATH) or not os.path.exists(filepath):
-        return False, ""
+        # Default to True if probe is unavailable to prevent false-positive silent detection
+        return True, "unknown"
     try:
         cmd = [FFMPEG_PATH, "-hide_banner", "-i", filepath]
-        res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True, errors="ignore", timeout=10)
+        res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True, errors="ignore", timeout=15)
         for line in res.stderr.splitlines():
             if "Audio:" in line:
                 parts = line.split("Audio:")[1].split()
@@ -178,7 +204,7 @@ def get_audio_info(filepath: str) -> tuple[bool, str]:
         return False, ""
     except Exception as e:
         logger.warning(f"Error checking audio stream in {filepath}: {e}")
-        return False, ""
+        return True, "unknown"
 
 def ensure_telegram_compatible_audio(video_path: str) -> tuple[str, bool]:
     """
@@ -1027,6 +1053,8 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     output_template = str(DOWNLOADS_DIR / f"{task_id}.%(ext)s")
     file_path = None
     audio_path = None
+    is_photo = False
+    extra_photos = []
 
     try:
         await asyncio.sleep(0.4)
@@ -1077,6 +1105,8 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_mention = f"@{bot_user}"
 
         has_audio = media_info.get("has_audio", True)
+        extra_photos = media_info.get("extra_photos") or []
+        is_photo = media_info.get("is_photo") or (Path(file_path).suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"])
 
         caption = (
             f"{get_emoji('MOVIE')} <b>{clean_title}</b>\n\n"
@@ -1090,9 +1120,6 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if not is_photo and not has_audio:
             caption += f"\n\n<blockquote>🔇 <i>Note: This video/Reel contains no audio track (original post was silent or muted on Instagram).</i></blockquote>"
-
-        extra_photos = media_info.get("extra_photos") or []
-        is_photo = media_info.get("is_photo") or (Path(file_path).suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"])
 
         # Cache video info for fast on-demand audio extraction
         audio_token = f"a_{int(time.time())}_{update.effective_user.id % 10000}"
@@ -1262,9 +1289,9 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     finally:
         # For photos, clean up immediately
-        if is_photo:
-            clean_list = [file_path]
-            if "extra_photos" in locals() and extra_photos:
+        if locals().get("is_photo", False):
+            clean_list = [file_path] if file_path else []
+            if locals().get("extra_photos"):
                 clean_list.extend(extra_photos)
             for p in clean_list:
                 if p and os.path.exists(p):
