@@ -593,6 +593,8 @@ def download_media_sync(url: str, output_template: str) -> dict:
         "noplaylist": True,
         "writethumbnail": False,
         "merge_output_format": "mp4",
+        "remote_components": ["ejs:github"],
+        "js_runtimes": {"node": {}, "deno": {}, "quickjs": {}},
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
