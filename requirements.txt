@@ -4,3 +4,4 @@ python-dotenv>=1.0.0
 imageio-ffmpeg>=0.5.0
 curl_cffi>=0.7.0
 pycryptodomex>=3.20.0
+parth-dl>=1.2.0
