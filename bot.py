@@ -43,7 +43,6 @@ from telegram.ext import (
     filters,
 )
 import yt_dlp
-from instagram_downloader import download_instagram
 
 # Premium Emojis helper import
 from premium import get_emoji, get_emoji_id
@@ -209,7 +208,7 @@ def get_audio_info(filepath: str) -> tuple[bool, str]:
 
 def ensure_telegram_compatible_audio(video_path: str) -> tuple[str, bool]:
     """
-    Ensure video has AAC audio codec for universal Telegram mobile/desktop playback.
+    Ensure video has standard AAC-LC audio codec for universal Telegram mobile/desktop playback.
     Returns (updated_video_path, has_audio).
     """
     if not FFMPEG_PATH or not os.path.exists(FFMPEG_PATH) or not os.path.exists(video_path):
@@ -219,19 +218,15 @@ def ensure_telegram_compatible_audio(video_path: str) -> tuple[str, bool]:
     if not has_audio:
         return video_path, False
 
-    # AAC (mp4a) is natively supported by Telegram ExoPlayer & iOS AVPlayer
-    if "aac" in codec or "mp4a" in codec:
-        return video_path, True
-
-    logger.info(f"Transcoding video audio from {codec} to standard AAC for Telegram playback in {video_path}...")
     base, ext = os.path.splitext(video_path)
-    fixed_path = f"{base}_aac.mp4"
+    fixed_path = f"{base}_lc.mp4"
     cmd = [
         FFMPEG_PATH, "-y",
         "-i", video_path,
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "192k",
+        "-ar", "44100",
         "-movflags", "+faststart",
         fixed_path
     ]
@@ -239,10 +234,9 @@ def ensure_telegram_compatible_audio(video_path: str) -> tuple[str, bool]:
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         if os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
             os.replace(fixed_path, video_path)
-            logger.info(f"Successfully converted audio to AAC: {video_path}")
             return video_path, True
     except Exception as e:
-        logger.warning(f"Audio transcode to AAC failed for {video_path}: {e}")
+        logger.warning(f"Audio normalization to AAC-LC failed for {video_path}: {e}")
         if os.path.exists(fixed_path):
             try:
                 os.remove(fixed_path)
@@ -669,6 +663,217 @@ def resolve_redirect_url(url: str) -> str:
             return resolved
     except Exception:
         return url
+
+def download_instagram_photos_graphql(url: str, output_path: str) -> dict:
+    """Download single photo or carousel photos from Instagram post."""
+    ydl = yt_dlp.YoutubeDL({"quiet": True})
+    ie = yt_dlp.extractor.instagram.InstagramIE(ydl)
+    match = ie._match_valid_url(url)
+    if not match:
+        raise ValueError(f"Invalid Instagram URL: {url}")
+
+    video_id, clean_url = match.group("id", "url")
+    media_id = str(yt_dlp.extractor.instagram._id_to_pk(video_id))
+    ie._real_initialize()
+
+    csrf_token = ie._get_cookies("https://www.instagram.com").get("csrftoken")
+    csrf_val = csrf_token.value if csrf_token else None
+
+    response = ie._download_json(
+        "https://www.instagram.com/api/graphql",
+        video_id,
+        fatal=False,
+        impersonate=True,
+        headers={
+            **ie._api_headers,
+            "X-FB-Friendly-Name": "PolarisLoggedOutDesktopWWWPostRootContentQuery",
+            "X-CSRFToken": csrf_val,
+            "X-FB-LSD": ie._lsd_token,
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": clean_url,
+        },
+        data=yt_dlp.extractor.instagram.urlencode_postdata({
+            "lsd": ie._lsd_token,
+            "fb_api_caller_class": "RelayModern",
+            "fb_api_req_friendly_name": "PolarisLoggedOutDesktopWWWPostRootContentQuery",
+            "server_timestamps": "true",
+            "variables": yt_dlp.utils.json.dumps({"media_id": media_id}, separators=(",", ":")),
+            "doc_id": "27130156389949648",
+        }),
+    )
+
+    media = yt_dlp.utils.traverse_obj(response, ("data", "xig_polaris_media", {dict}))
+    product_info = yt_dlp.utils.traverse_obj(media, ("if_not_gated_logged_out", {dict}))
+    if not product_info:
+        raise ValueError("This Instagram post is private or requires login authentication.")
+
+    info_dict = ie._extract_product(product_info, video_id=video_id, get_comments=False)
+    title = info_dict.get("title") or "Instagram Photo Post"
+    uploader = info_dict.get("uploader") or info_dict.get("channel") or "Instagram Creator"
+
+    carousel = yt_dlp.utils.traverse_obj(product_info, ("carousel_media", ..., {dict}))
+    image_urls = []
+
+    if carousel:
+        for item in carousel:
+            img_candidates = yt_dlp.utils.traverse_obj(item, ("image_versions2", "candidates", ..., {dict}))
+            if img_candidates:
+                best = max(img_candidates, key=lambda x: (x.get("width", 0) * x.get("height", 0)))
+                image_urls.append(best["url"])
+    else:
+        img_candidates = yt_dlp.utils.traverse_obj(product_info, ("image_versions2", "candidates", ..., {dict}))
+        if img_candidates:
+            best = max(img_candidates, key=lambda x: (x.get("width", 0) * x.get("height", 0)))
+            image_urls.append(best["url"])
+        elif info_dict.get("thumbnails"):
+            image_urls.append(info_dict["thumbnails"][-1]["url"])
+
+    if not image_urls:
+        raise ValueError("No images could be extracted from this Instagram post.")
+
+    # Download primary photo
+    req = urllib.request.Request(image_urls[0], headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as resp, open(output_path, "wb") as f:
+        f.write(resp.read())
+
+    # Download additional carousel images (up to 9 more)
+    extra_paths = []
+    base_name, _ = os.path.splitext(output_path)
+    for idx, img_url in enumerate(image_urls[1:10], start=2):
+        extra_path = f"{base_name}_{idx}.jpg"
+        req = urllib.request.Request(img_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp, open(extra_path, "wb") as f:
+            f.write(resp.read())
+        extra_paths.append(extra_path)
+
+    file_size = os.path.getsize(output_path)
+    for ep in extra_paths:
+        if os.path.exists(ep):
+            file_size += os.path.getsize(ep)
+
+    return {
+        "file_path": output_path,
+        "title": title,
+        "duration": None,
+        "uploader": uploader,
+        "filesize": file_size,
+        "width": None,
+        "height": None,
+        "extra_photos": extra_paths,
+        "is_photo": True,
+        "has_audio": False,
+    }
+
+def download_instagram(url: str, output_template: str) -> dict:
+    """Download Instagram Reel, Video, Photo, or Carousel synchronously with guaranteed audio."""
+    clean_url = url.split("?")[0].rstrip("/")
+    is_photo_post_url = "/p/" in clean_url.lower()
+
+    ydl_opts = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": output_template,
+        "max_filesize": MAX_FILESIZE_BYTES,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "writethumbnail": False,
+        "merge_output_format": "mp4",
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+
+    if COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 0:
+        ydl_opts["cookiefile"] = str(COOKIES_PATH)
+
+    if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
+        ydl_opts["ffmpeg_location"] = FFMPEG_PATH
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if "entries" in info and info["entries"]:
+                info = info["entries"][0]
+
+            filename = ydl.prepare_filename(info)
+            if not os.path.exists(filename):
+                base, _ = os.path.splitext(filename)
+                for ext in [".mp4", ".mkv", ".webm"]:
+                    if os.path.exists(base + ext):
+                        filename = base + ext
+                        break
+
+            if not os.path.exists(filename):
+                raise FileNotFoundError("Video file was not saved to disk by downloader.")
+
+            # Verify audio stream & normalize to standard AAC-LC for Telegram mobile playback
+            has_audio, _ = get_audio_info(filename)
+            if has_audio:
+                filename, has_audio = ensure_telegram_compatible_audio(filename)
+            else:
+                # Video has no audio stream (e.g. separate DASH music track on Instagram)
+                formats = info.get("formats", [])
+                audio_fmts = [
+                    f for f in formats
+                    if (f.get("vcodec") == "none" or not f.get("vcodec"))
+                    and (f.get("acodec") and f.get("acodec") != "none" or f.get("format_id", "").endswith("a"))
+                    and f.get("url")
+                ]
+                if audio_fmts and FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
+                    best_audio = audio_fmts[-1]
+                    audio_url = best_audio["url"]
+                    temp_audio = str(DOWNLOADS_DIR / f"temp_music_{int(time.time())}.m4a")
+                    try:
+                        req = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=25) as resp, open(temp_audio, "wb") as af:
+                            af.write(resp.read())
+                        if os.path.exists(temp_audio) and os.path.getsize(temp_audio) > 0:
+                            merged_file = str(DOWNLOADS_DIR / f"merged_{int(time.time())}.mp4")
+                            m_cmd = [
+                                FFMPEG_PATH, "-y",
+                                "-i", filename,
+                                "-i", temp_audio,
+                                "-c:v", "copy",
+                                "-c:a", "aac",
+                                "-b:a", "192k",
+                                "-ar", "44100",
+                                "-movflags", "+faststart",
+                                "-shortest",
+                                merged_file,
+                            ]
+                            subprocess.run(m_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+                            if os.path.exists(merged_file) and os.path.getsize(merged_file) > 0:
+                                os.replace(merged_file, filename)
+                                has_audio = True
+                                logger.info("Successfully merged separate Instagram music track into video!")
+                    except Exception as me:
+                        logger.warning(f"Error merging separate audio track: {me}")
+                    finally:
+                        if os.path.exists(temp_audio):
+                            try:
+                                os.remove(temp_audio)
+                            except Exception:
+                                pass
+
+            return {
+                "file_path": filename,
+                "title": info.get("title") or "Instagram Reel",
+                "duration": info.get("duration"),
+                "uploader": info.get("uploader") or info.get("channel") or "Instagram Creator",
+                "filesize": info.get("filesize") or (os.path.getsize(filename) if os.path.exists(filename) else 0),
+                "width": info.get("width"),
+                "height": info.get("height"),
+                "is_photo": False,
+                "has_audio": has_audio,
+                "extra_photos": [],
+            }
+    except Exception as e:
+        err_str = str(e).lower()
+        if is_photo_post_url or "no video" in err_str or "empty media" in err_str or "format" in err_str:
+            photo_path = output_template.replace("%(ext)s", "jpg")
+            return download_instagram_photos_graphql(url, photo_path)
+        raise
 
 # Core Downloader Logic
 def download_media_sync(url: str, output_template: str) -> dict:
