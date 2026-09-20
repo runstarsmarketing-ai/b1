@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import html
 import logging
 import os
@@ -196,6 +197,74 @@ DB_PATH = BASE_DIR / "users.db"
 MAX_FILESIZE_BYTES = 50 * 1024 * 1024
 COOKIES_PATH = BASE_DIR / "cookies.txt"
 
+# High-concurrency thread pool executor for non-blocking downloads
+DOWNLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32)
+
+# In-memory cache for on-demand audio downloads
+AUDIO_CACHE = {}
+
+def cleanup_old_downloads():
+    """Purge temporary files older than 10 minutes to save disk space while allowing instant on-demand audio."""
+    now = time.time()
+    try:
+        for p in DOWNLOADS_DIR.iterdir():
+            if p.is_file() and (now - p.stat().st_mtime > 600):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    expired = [k for k, v in list(AUDIO_CACHE.items()) if now - v.get("created_at", 0) > 900]
+    for k in expired:
+        AUDIO_CACHE.pop(k, None)
+
+def download_audio_sync(url: str, output_template: str) -> dict:
+    """Download audio track directly as MP3 using yt-dlp."""
+    target_url = resolve_redirect_url(url)
+    base, _ = os.path.splitext(output_template)
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": f"{base}.%(ext)s",
+        "max_filesize": MAX_FILESIZE_BYTES,
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "writethumbnail": False,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+        "remote_components": ["ejs:github"],
+        "js_runtimes": {"node": {}, "deno": {}, "quickjs": {}},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+    if COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 0:
+        ydl_opts["cookiefile"] = str(COOKIES_PATH)
+    if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
+        ydl_opts["ffmpeg_location"] = FFMPEG_PATH
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(target_url, download=True)
+        if "entries" in info and info["entries"]:
+            info = info["entries"][0]
+        filename = ydl.prepare_filename(info)
+        base_f, _ = os.path.splitext(filename)
+        mp3_file = base_f + ".mp3"
+        if not os.path.exists(mp3_file) and os.path.exists(filename):
+            mp3_file = filename
+        return {
+            "file_path": mp3_file,
+            "title": info.get("title", "Audio Track"),
+            "uploader": info.get("uploader", info.get("channel", "Creator")),
+            "duration": info.get("duration"),
+            "filesize": os.path.getsize(mp3_file) if os.path.exists(mp3_file) else 0,
+        }
+
 # Optional YouTube cookies from environment variable
 raw_cookies = os.getenv("YOUTUBE_COOKIES", "").strip()
 if raw_cookies:
@@ -214,7 +283,7 @@ if raw_cookies:
 # --- Database Helpers (SQLite) ---
 def init_db():
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -230,7 +299,7 @@ def init_db():
 
 def add_user(user_id: int, username: str | None = None, first_name: str | None = None):
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             conn.execute(
                 """
                 INSERT INTO users (user_id, username, first_name)
@@ -247,7 +316,7 @@ def add_user(user_id: int, username: str | None = None, first_name: str | None =
 
 def get_total_users() -> int:
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             cur = conn.cursor()
             cur.execute("SELECT COUNT(*) FROM users")
             row = cur.fetchone()
@@ -257,7 +326,7 @@ def get_total_users() -> int:
 
 def get_all_user_ids() -> list[int]:
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             cur = conn.cursor()
             cur.execute("SELECT user_id FROM users")
             return [r[0] for r in cur.fetchall()]
@@ -267,7 +336,7 @@ def get_all_user_ids() -> list[int]:
 def import_user_ids(id_list: list[int]) -> tuple[int, int]:
     new_added = 0
     try:
-        with sqlite3.connect(DB_PATH) as conn:
+        with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
             cur = conn.cursor()
             for uid in id_list:
                 cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
@@ -810,7 +879,11 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=constants.ParseMode.HTML,
         )
 
-        media_info = await asyncio.to_thread(download_media_sync, url, output_template)
+        # Concurrently execute media download without blocking event loop or other users
+        loop = asyncio.get_running_loop()
+        media_info = await loop.run_in_executor(
+            DOWNLOAD_EXECUTOR, download_media_sync, url, output_template
+        )
         file_path = media_info["file_path"]
 
         if not os.path.exists(file_path):
@@ -854,34 +927,62 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{get_emoji('SPARKLES')} <i>Downloaded by</i> <b>{bot_mention}</b>"
         )
 
-        buttons = [
-            [
+        extra_photos = media_info.get("extra_photos") or []
+        is_photo = media_info.get("is_photo") or (Path(file_path).suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"])
+
+        # Cache video info for fast on-demand audio extraction
+        audio_token = f"a_{int(time.time())}_{update.effective_user.id % 10000}"
+        if not is_photo:
+            AUDIO_CACHE[audio_token] = {
+                "url": url,
+                "file_path": file_path,
+                "title": clean_title,
+                "uploader": clean_uploader,
+                "duration": media_info.get("duration"),
+                "created_at": time.time(),
+            }
+
+        buttons = []
+        if not is_photo:
+            buttons.append([
+                InlineKeyboardButton(
+                    "Audio (MP3)",
+                    callback_data=f"aud:{audio_token}",
+                    style=constants.KeyboardButtonStyle.PRIMARY,
+                    icon_custom_emoji_id=get_emoji_id("AUDIO"),
+                ),
                 InlineKeyboardButton(
                     "Original Source",
                     url=url,
                     style=constants.KeyboardButtonStyle.PRIMARY,
                     icon_custom_emoji_id=get_emoji_id(platform["name"]) or get_emoji_id("LINK"),
                 ),
+            ])
+        else:
+            buttons.append([
                 InlineKeyboardButton(
-                    "Channel",
-                    url=CHANNEL_URL,
-                    style=constants.KeyboardButtonStyle.SUCCESS,
-                    icon_custom_emoji_id=get_emoji_id("CHANNEL"),
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    "Share Bot",
-                    url=f"https://t.me/share/url?url=https://t.me/{bot_user}&text=Check%20out%20this%20awesome%20All-in-One%20Video%20Downloader%20Bot!",
+                    "Original Source",
+                    url=url,
                     style=constants.KeyboardButtonStyle.PRIMARY,
-                    icon_custom_emoji_id=get_emoji_id("ROCKET"),
-                )
-            ],
-        ]
-        reply_markup = InlineKeyboardMarkup(buttons)
+                    icon_custom_emoji_id=get_emoji_id(platform["name"]) or get_emoji_id("LINK"),
+                ),
+            ])
 
-        extra_photos = media_info.get("extra_photos") or []
-        is_photo = media_info.get("is_photo") or (Path(file_path).suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"])
+        buttons.append([
+            InlineKeyboardButton(
+                "Channel",
+                url=CHANNEL_URL,
+                style=constants.KeyboardButtonStyle.SUCCESS,
+                icon_custom_emoji_id=get_emoji_id("CHANNEL"),
+            ),
+            InlineKeyboardButton(
+                "Share Bot",
+                url=f"https://t.me/share/url?url=https://t.me/{bot_user}&text=Check%20out%20this%20awesome%20All-in-One%20Video%20Downloader%20Bot!",
+                style=constants.KeyboardButtonStyle.PRIMARY,
+                icon_custom_emoji_id=get_emoji_id("ROCKET"),
+            ),
+        ])
+        reply_markup = InlineKeyboardMarkup(buttons)
         
         # 1. Send Video, Photo, or Multi-Photo Carousel Album
         try:
@@ -951,43 +1052,14 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Error sending media: {e}")
 
-        # 2. Extract and send MP3 audio track along with video
-        if not is_photo and file_path and os.path.exists(file_path):
-            try:
-                audio_path = str(DOWNLOADS_DIR / f"{task_id}.mp3")
-                has_audio = await asyncio.to_thread(extract_audio_mp3_sync, file_path, audio_path)
-                if has_audio and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
-                    audio_size = os.path.getsize(audio_path)
-                    audio_caption = (
-                        f"{get_emoji('AUDIO')} <b>Audio Track (MP3)</b>\n\n"
-                        "<blockquote>"
-                        f"{get_emoji('MOVIE')} <b>Title:</b> {clean_title}\n"
-                        f"{get_emoji('AUTHOR')} <b>Artist:</b> {clean_uploader}\n"
-                        f"{get_emoji('DURATION')} <b>Duration:</b> {format_duration(media_info['duration'])}\n"
-                        f"{get_emoji('SIZE')} <b>Size:</b> {format_bytes(audio_size)}\n"
-                        "</blockquote>\n"
-                        f"{get_emoji('SPARKLES')} <i>Downloaded by</i> <b>{bot_mention}</b>"
-                    )
-                    with open(audio_path, "rb") as audio_file:
-                        await safe_reply_audio(
-                            update.message,
-                            audio=audio_file,
-                            caption=audio_caption,
-                            title=str(media_info.get("title", "Audio"))[:60],
-                            performer=str(media_info.get("uploader", "Creator"))[:40],
-                            duration=int(media_info["duration"]) if media_info["duration"] else None,
-                            parse_mode=constants.ParseMode.HTML,
-                            reply_markup=reply_markup,
-                            read_timeout=240,
-                            write_timeout=240,
-                        )
-            except Exception as e:
-                logger.error(f"Error sending audio: {e}")
-
+        # Delete processing status message
         try:
             await status_msg.delete()
         except Exception:
             pass
+
+        # Clean up files older than 10 mins
+        cleanup_old_downloads()
 
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download error: {e}")
@@ -1020,15 +1092,17 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     finally:
-        clean_list = [file_path, audio_path]
-        if "extra_photos" in locals() and extra_photos:
-            clean_list.extend(extra_photos)
-        for p in clean_list:
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception as e:
-                    logger.warning(f"Could not delete temp file {p}: {e}")
+        # For photos, clean up immediately
+        if is_photo:
+            clean_list = [file_path]
+            if "extra_photos" in locals() and extra_photos:
+                clean_list.extend(extra_photos)
+            for p in clean_list:
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
 
 # Command: /admin or /stats
 async def admin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1417,6 +1491,104 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    elif data.startswith("aud:"):
+        token = data.split(":", 1)[1]
+        item = AUDIO_CACHE.get(token)
+        if not item:
+            await query.answer("⚠️ Audio request expired. Please resend the media link.", show_alert=True)
+            return
+
+        await query.answer("🎵 Extracting MP3 audio...")
+
+        status_msg = await query.message.reply_text(
+            f"{get_emoji('AUDIO')} <b>Audio Track Processing</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            f"<blockquote>{get_emoji('HOURGLASS')} <i>Extracting high-quality MP3 stream...</i></blockquote>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+
+        audio_task_id = f"aud_{query.from_user.id}_{int(time.time())}"
+        audio_path = str(DOWNLOADS_DIR / f"{audio_task_id}.mp3")
+        file_path = item.get("file_path")
+        media_url = item.get("url")
+        success = False
+
+        try:
+            # 1. Try local extraction first if video file is still present
+            if file_path and os.path.exists(file_path):
+                loop = asyncio.get_running_loop()
+                success = await loop.run_in_executor(
+                    DOWNLOAD_EXECUTOR, extract_audio_mp3_sync, file_path, audio_path
+                )
+
+            # 2. If video was purged, download audio track directly with yt-dlp
+            if not success or not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                audio_template = str(DOWNLOADS_DIR / f"{audio_task_id}.%(ext)s")
+                loop = asyncio.get_running_loop()
+                dl_info = await loop.run_in_executor(
+                    DOWNLOAD_EXECUTOR, download_audio_sync, media_url, audio_template
+                )
+                if dl_info and os.path.exists(dl_info.get("file_path", "")):
+                    audio_path = dl_info["file_path"]
+                    success = True
+
+            if success and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0:
+                audio_size = os.path.getsize(audio_path)
+                bot_info = await context.bot.get_me()
+                bot_user = bot_info.username if bot_info.username else "FastVidsSaverBot"
+                clean_title = item.get("title", "Audio Track")
+                clean_uploader = item.get("uploader", "Creator")
+                duration = item.get("duration")
+
+                audio_caption = (
+                    f"{get_emoji('AUDIO')} <b>Audio Track (MP3)</b>\n\n"
+                    "<blockquote>"
+                    f"{get_emoji('MOVIE')} <b>Title:</b> {clean_title}\n"
+                    f"{get_emoji('AUTHOR')} <b>Artist:</b> {clean_uploader}\n"
+                    f"{get_emoji('DURATION')} <b>Duration:</b> {format_duration(duration)}\n"
+                    f"{get_emoji('SIZE')} <b>Size:</b> {format_bytes(audio_size)}\n"
+                    "</blockquote>\n"
+                    f"{get_emoji('SPARKLES')} <i>Downloaded by</i> <b>@{bot_user}</b>"
+                )
+
+                with open(audio_path, "rb") as af:
+                    await safe_reply_audio(
+                        query.message,
+                        audio=af,
+                        caption=audio_caption,
+                        title=str(clean_title)[:60],
+                        performer=str(clean_uploader)[:40],
+                        duration=int(duration) if duration else None,
+                        parse_mode=constants.ParseMode.HTML,
+                        read_timeout=240,
+                        write_timeout=240,
+                    )
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            else:
+                await safe_edit_text(
+                    status_msg,
+                    f"{get_emoji('FAILED')} <b>Audio Extraction Failed</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    "<blockquote>Unable to extract audio from this media.</blockquote>",
+                    parse_mode=constants.ParseMode.HTML,
+                )
+        except Exception as e:
+            logger.error(f"Error handling on-demand audio: {e}", exc_info=True)
+            await safe_edit_text(
+                status_msg,
+                f"{get_emoji('FAILED')} <b>Audio Extraction Error:</b> <code>{html.escape(str(e)[:100])}</code>",
+                parse_mode=constants.ParseMode.HTML,
+            )
+        finally:
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except Exception:
+                    pass
+
 # --- Embedded Web Server for Render / Cloud Hosting ---
 class RenderHealthCheckServer(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -1530,26 +1702,32 @@ def main():
 
     print("🚀 Starting All-in-One Downloader Bot...")
     t_request = HTTPXRequest(
-        connection_pool_size=16,
+        connection_pool_size=64,
         connect_timeout=60.0,
         read_timeout=180.0,
         write_timeout=180.0,
         media_write_timeout=360.0,
     )
-    app = ApplicationBuilder().token(BOT_TOKEN).request(t_request).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(t_request)
+        .concurrent_updates(True)
+        .build()
+    )
 
-    # Handlers
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("help", help_handler))
-    app.add_handler(CommandHandler("ping", ping_handler))
-    app.add_handler(CommandHandler("admin", admin_handler))
-    app.add_handler(CommandHandler("stats", admin_handler))
-    app.add_handler(CommandHandler("broadcast", broadcast_handler))
-    app.add_handler(CommandHandler("export_users", export_users_handler))
-    app.add_handler(CommandHandler("import_users", import_users_handler))
-    app.add_handler(CallbackQueryHandler(callback_router))
-    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler))
+    # Handlers (block=False enables instant parallel execution for all users)
+    app.add_handler(CommandHandler("start", start_handler, block=False))
+    app.add_handler(CommandHandler("help", help_handler, block=False))
+    app.add_handler(CommandHandler("ping", ping_handler, block=False))
+    app.add_handler(CommandHandler("admin", admin_handler, block=False))
+    app.add_handler(CommandHandler("stats", admin_handler, block=False))
+    app.add_handler(CommandHandler("broadcast", broadcast_handler, block=False))
+    app.add_handler(CommandHandler("export_users", export_users_handler, block=False))
+    app.add_handler(CommandHandler("import_users", import_users_handler, block=False))
+    app.add_handler(CallbackQueryHandler(callback_router, block=False))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_handler, block=False))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, link_handler, block=False))
 
     print("✨ Bot is active and listening for messages! Press Ctrl+C to stop.")
     app.run_polling(drop_pending_updates=True)
