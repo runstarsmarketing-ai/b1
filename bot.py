@@ -163,6 +163,67 @@ def extract_audio_mp3_sync(video_path: str, mp3_path: str) -> bool:
         logger.warning(f"Audio extraction error: {e}")
         return False
 
+def get_audio_info(filepath: str) -> tuple[bool, str]:
+    """Check if a media file contains an audio stream, and return (has_audio, codec_name)."""
+    if not FFMPEG_PATH or not os.path.exists(FFMPEG_PATH) or not os.path.exists(filepath):
+        return False, ""
+    try:
+        cmd = [FFMPEG_PATH, "-hide_banner", "-i", filepath]
+        res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True, errors="ignore", timeout=10)
+        for line in res.stderr.splitlines():
+            if "Audio:" in line:
+                parts = line.split("Audio:")[1].split()
+                codec = parts[0].strip(",").lower() if parts else "unknown"
+                return True, codec
+        return False, ""
+    except Exception as e:
+        logger.warning(f"Error checking audio stream in {filepath}: {e}")
+        return False, ""
+
+def ensure_telegram_compatible_audio(video_path: str) -> tuple[str, bool]:
+    """
+    Ensure video has AAC audio codec for universal Telegram mobile/desktop playback.
+    Returns (updated_video_path, has_audio).
+    """
+    if not FFMPEG_PATH or not os.path.exists(FFMPEG_PATH) or not os.path.exists(video_path):
+        return video_path, True
+    
+    has_audio, codec = get_audio_info(video_path)
+    if not has_audio:
+        return video_path, False
+
+    # AAC (mp4a) is natively supported by Telegram ExoPlayer & iOS AVPlayer
+    if "aac" in codec or "mp4a" in codec:
+        return video_path, True
+
+    logger.info(f"Transcoding video audio from {codec} to standard AAC for Telegram playback in {video_path}...")
+    base, ext = os.path.splitext(video_path)
+    fixed_path = f"{base}_aac.mp4"
+    cmd = [
+        FFMPEG_PATH, "-y",
+        "-i", video_path,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        fixed_path
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
+            os.replace(fixed_path, video_path)
+            logger.info(f"Successfully converted audio to AAC: {video_path}")
+            return video_path, True
+    except Exception as e:
+        logger.warning(f"Audio transcode to AAC failed for {video_path}: {e}")
+        if os.path.exists(fixed_path):
+            try:
+                os.remove(fixed_path)
+            except Exception:
+                pass
+    return video_path, True
+
+
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -685,7 +746,7 @@ def download_media_sync(url: str, output_template: str) -> dict:
     is_instagram = "instagram.com" in target_url.lower()
 
     ydl_opts = {
-        "format": "bestvideo+bestaudio/best[acodec!=none]/best",
+        "format": "bestvideo+bestaudio/best",
         "outtmpl": output_template,
         "max_filesize": MAX_FILESIZE_BYTES,
         "quiet": True,
@@ -694,7 +755,9 @@ def download_media_sync(url: str, output_template: str) -> dict:
         "writethumbnail": False,
         "merge_output_format": "mp4",
         "postprocessor_args": {
-            "Merger": ["-c:a", "aac"],
+            "merger": ["-c:v", "copy", "-c:a", "aac"],
+            "Merger": ["-c:v", "copy", "-c:a", "aac"],
+            "VideoConvertor": ["-c:v", "copy", "-c:a", "aac"],
         },
         "remote_components": ["ejs:github"],
         "js_runtimes": {"node": {}, "deno": {}, "quickjs": {}},
@@ -760,6 +823,68 @@ def download_media_sync(url: str, output_template: str) -> dict:
                         filename = base + ext
                         break
 
+            # Verify audio stream & recover audio if silent
+            has_audio, audio_codec = get_audio_info(filename)
+
+            if not has_audio and is_instagram:
+                # 1. Check if another format in info['formats'] has audio (e.g. progressive format 0/1/2)
+                formats = info.get("formats", [])
+                audio_candidates = [
+                    f for f in formats
+                    if f.get("url") and f.get("format_id") != info.get("format_id")
+                    and (f.get("format_id") in ["0", "1", "2"] or (f.get("acodec") and f.get("acodec") != "none"))
+                ]
+                for cand in audio_candidates:
+                    cand_url = cand.get("url")
+                    if not cand_url:
+                        continue
+                    temp_cand = str(DOWNLOADS_DIR / f"alt_cand_{int(time.time())}.mp4")
+                    try:
+                        req = urllib.request.Request(cand_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=20) as resp, open(temp_cand, "wb") as cf:
+                            cf.write(resp.read())
+                        if os.path.exists(temp_cand) and os.path.getsize(temp_cand) > 0:
+                            cand_has_audio, cand_codec = get_audio_info(temp_cand)
+                            if cand_has_audio:
+                                os.replace(temp_cand, filename)
+                                has_audio = True
+                                audio_codec = cand_codec
+                                logger.info("Recovered Instagram video with audio from alternative format candidate!")
+                                break
+                            else:
+                                try:
+                                    os.remove(temp_cand)
+                                except Exception:
+                                    pass
+                    except Exception as ce:
+                        logger.warning(f"Error checking alternative candidate: {ce}")
+
+                # 2. Try parth_dl fallback for Instagram reels
+                if not has_audio:
+                    try:
+                        import parth_dl
+                        parth_temp = str(DOWNLOADS_DIR / f"parth_{int(time.time())}.mp4")
+                        dl = parth_dl.InstagramDownloader(verbose=False)
+                        p_paths = dl.download(target_url, output_path=parth_temp, output_mode="file")
+                        if p_paths and os.path.exists(p_paths[0]):
+                            p_has_audio, p_codec = get_audio_info(p_paths[0])
+                            if p_has_audio:
+                                os.replace(p_paths[0], filename)
+                                has_audio = True
+                                audio_codec = p_codec
+                                logger.info("Recovered Instagram video with audio from parth_dl fallback!")
+                            else:
+                                try:
+                                    os.remove(p_paths[0])
+                                except Exception:
+                                    pass
+                    except Exception as pe:
+                        logger.warning(f"parth_dl fallback error: {pe}")
+
+            # Ensure AAC audio for Telegram universal compatibility
+            if has_audio:
+                filename, has_audio = ensure_telegram_compatible_audio(filename)
+
             return {
                 "file_path": filename,
                 "title": info.get("title", "Media Video"),
@@ -769,6 +894,7 @@ def download_media_sync(url: str, output_template: str) -> dict:
                 "width": info.get("width"),
                 "height": info.get("height"),
                 "is_photo": False,
+                "has_audio": has_audio,
                 "extra_photos": [],
             }
     except Exception as e:
@@ -950,6 +1076,8 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_user = bot_info.username if bot_info.username else "FastVidsSaverBot"
         bot_mention = f"@{bot_user}"
 
+        has_audio = media_info.get("has_audio", True)
+
         caption = (
             f"{get_emoji('MOVIE')} <b>{clean_title}</b>\n\n"
             "<blockquote>"
@@ -960,13 +1088,15 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "</blockquote>\n"
             f"{get_emoji('SPARKLES')} <i>Downloaded by</i> <b>{bot_mention}</b>"
         )
+        if not is_photo and not has_audio:
+            caption += f"\n\n<blockquote>🔇 <i>Note: This video/Reel contains no audio track (original post was silent or muted on Instagram).</i></blockquote>"
 
         extra_photos = media_info.get("extra_photos") or []
         is_photo = media_info.get("is_photo") or (Path(file_path).suffix.lower() in [".jpg", ".jpeg", ".png", ".webp"])
 
         # Cache video info for fast on-demand audio extraction
         audio_token = f"a_{int(time.time())}_{update.effective_user.id % 10000}"
-        if not is_photo:
+        if not is_photo and has_audio:
             AUDIO_CACHE[audio_token] = {
                 "url": url,
                 "file_path": file_path,
@@ -978,20 +1108,25 @@ async def link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         buttons = []
         if not is_photo:
-            buttons.append([
-                InlineKeyboardButton(
-                    "Audio (MP3)",
-                    callback_data=f"aud:{audio_token}",
-                    style=constants.KeyboardButtonStyle.PRIMARY,
-                    icon_custom_emoji_id=get_emoji_id("AUDIO"),
-                ),
+            first_row = []
+            if has_audio:
+                first_row.append(
+                    InlineKeyboardButton(
+                        "Audio (MP3)",
+                        callback_data=f"aud:{audio_token}",
+                        style=constants.KeyboardButtonStyle.PRIMARY,
+                        icon_custom_emoji_id=get_emoji_id("AUDIO"),
+                    )
+                )
+            first_row.append(
                 InlineKeyboardButton(
                     "Original Source",
                     url=url,
                     style=constants.KeyboardButtonStyle.PRIMARY,
                     icon_custom_emoji_id=get_emoji_id(platform["name"]) or get_emoji_id("LINK"),
-                ),
-            ])
+                )
+            )
+            buttons.append(first_row)
         else:
             buttons.append([
                 InlineKeyboardButton(
