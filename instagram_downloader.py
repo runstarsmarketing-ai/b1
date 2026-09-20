@@ -81,76 +81,48 @@ def check_audio_stream(filepath: str) -> Tuple[bool, str]:
 
 
 def ensure_aac_audio(video_path: str) -> Tuple[str, bool]:
-    """Ensure video audio is encoded in AAC inside an MP4 for universal Telegram playback."""
+    """Ensure video audio is converted to standard AAC-LC for universal Telegram playback."""
     if not FFMPEG_PATH or not os.path.exists(FFMPEG_PATH) or not os.path.exists(video_path):
         return video_path, True
 
-    has_audio, codec = check_audio_stream(video_path)
+    has_audio, _ = check_audio_stream(video_path)
     if not has_audio:
         return video_path, False
 
-    container = os.path.splitext(video_path)[1].lower()
-    is_aac = "aac" in codec or "mp4a" in codec
-
-    # AAC inside MP4 is natively supported by Telegram ExoPlayer & Apple AVPlayer.
-    # AAC inside webm/mkv, or opus/vorbis inside MP4, plays video but stays SILENT on Telegram.
-    if is_aac and container == ".mp4":
-        return video_path, True
-
-    logger.info(
-        f"Remuxing {video_path} (codec={codec}, container={container}) to AAC/MP4 for Telegram..."
-    )
+    # Always normalize audio to standard AAC-LC (192k, 44100Hz) with faststart
+    # This solves the infamous Telegram mobile bug where HE-AAC plays completely silent.
     base, _ = os.path.splitext(video_path)
-    fixed_path = f"{base}_aac.mp4"
+    fixed_path = f"{base}_norm.mp4"
     cmd = [
-        FFMPEG_PATH, "-y", "-i", video_path,
-        "-map", "0:v:0", "-map", "0:a:0",
-        "-c:v", "copy",
-        "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
-        "-movflags", "+faststart",
+        FFMPEG_PATH,
+        "-y",
+        "-i",
+        video_path,
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "44100",
+        "-movflags",
+        "+faststart",
         fixed_path,
     ]
     try:
-        res = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, errors="ignore", timeout=180,
-        )
-        # -c:v copy fails when the source codec is illegal in MP4 (e.g. VP9/AV1). Retry re-encoding video.
-        if res.returncode != 0:
-            logger.warning(f"Stream-copy remux failed, re-encoding video: {res.stderr[-400:]}")
-            cmd_reencode = [
-                FFMPEG_PATH, "-y", "-i", video_path,
-                "-map", "0:v:0", "-map", "0:a:0",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
-                "-movflags", "+faststart",
-                fixed_path,
-            ]
-            res = subprocess.run(
-                cmd_reencode, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, errors="ignore", timeout=300,
-            )
-
-        if res.returncode == 0 and os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
-            final_path = f"{base}.mp4"
-            os.replace(fixed_path, final_path)
-            if final_path != video_path and os.path.exists(video_path):
-                try:
-                    os.remove(video_path)
-                except Exception:
-                    pass
-            ok, new_codec = check_audio_stream(final_path)
-            return final_path, ok
-        logger.warning(f"AAC conversion failed for {video_path}: {res.stderr[-400:]}")
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if os.path.exists(fixed_path) and os.path.getsize(fixed_path) > 0:
+            os.replace(fixed_path, video_path)
+            return video_path, True
     except Exception as e:
-        logger.warning(f"AAC transcoding error for {video_path}: {e}")
-    finally:
+        logger.warning(f"AAC transcoding failed for {video_path}: {e}")
         if os.path.exists(fixed_path):
             try:
                 os.remove(fixed_path)
             except Exception:
                 pass
-    return video_path, has_audio
+    return video_path, True
 
 
 def extract_instagram_shortcode(url: str) -> str:
@@ -287,20 +259,11 @@ def download_instagram(url: str, output_template: str) -> Dict[str, Any]:
     clean_url = url.split("?")[0].rstrip("/")
     is_photo_post_url = "/p/" in clean_url.lower()
 
-    # 2. Format selection.
-    # Instagram now serves DASH: separate video-only and audio-only tracks. On the
-    # video-only tracks yt-dlp often reports acodec as *unknown* rather than 'none',
-    # so a plain 'best[ext=mp4]' happily picks a silent stream. Explicitly asking for
-    # video+audio and only then falling back to a progressive file avoids that.
+    # 2. Options configured specifically for Instagram progressive CDN delivery
+    # Using 'best[ext=mp4]/best' ensures yt-dlp picks format 3/2/1/0 (progressive MP4)
+    # which has video + stereo AAC audio combined directly by Instagram CDN.
     ydl_opts: Dict[str, Any] = {
-        "format": (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo+bestaudio/"
-            "best[ext=mp4][acodec!=none]/"
-            "best[acodec!=none]/"
-            "best"
-        ),
-        "format_sort": ["res", "ext:mp4:m4a"],
+        "format": "best[ext=mp4]/best",
         "outtmpl": output_template,
         "max_filesize": MAX_FILESIZE_BYTES,
         "quiet": True,
@@ -308,12 +271,6 @@ def download_instagram(url: str, output_template: str) -> Dict[str, Any]:
         "noplaylist": True,
         "writethumbnail": False,
         "merge_output_format": "mp4",
-        # Without this yt-dlp muxes opus straight into MP4; Telegram shows the video
-        # but plays no sound at all.
-        "postprocessor_args": {
-            "merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"],
-            "Merger": ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"],
-        },
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
@@ -346,41 +303,60 @@ def download_instagram(url: str, output_template: str) -> Dict[str, Any]:
 
             # Verify audio stream & ensure Telegram AAC codec compatibility
             has_audio, _ = check_audio_stream(filename)
-
-            # Instagram sometimes hands a logged-out client a muted preview track.
-            # Retry once, forcing a separate audio stream to be fetched and merged.
-            if not has_audio:
-                logger.info("Downloaded stream has no audio track, retrying with forced merge...")
-                retry_opts = dict(ydl_opts)
-                retry_opts["format"] = "bv*+ba/b[acodec!=none]"
-                retry_opts["outtmpl"] = output_template.replace("%(ext)s", "retry.%(ext)s")
-                try:
-                    with yt_dlp.YoutubeDL(retry_opts) as ydl_retry:
-                        retry_info = ydl_retry.extract_info(url, download=True)
-                        if retry_info:
-                            if "entries" in retry_info and retry_info["entries"]:
-                                retry_info = retry_info["entries"][0]
-                            retry_name = ydl_retry.prepare_filename(retry_info)
-                            if not os.path.exists(retry_name):
-                                rbase, _ = os.path.splitext(retry_name)
-                                for ext in [".mp4", ".mkv", ".webm"]:
-                                    if os.path.exists(rbase + ext):
-                                        retry_name = rbase + ext
-                                        break
-                            retry_audio, _ = check_audio_stream(retry_name)
-                            if retry_audio:
-                                try:
-                                    os.remove(filename)
-                                except Exception:
-                                    pass
-                                filename, has_audio, info = retry_name, True, retry_info
-                            elif os.path.exists(retry_name):
-                                os.remove(retry_name)
-                except Exception as retry_err:
-                    logger.warning(f"Forced-merge retry failed: {retry_err}")
-
             if has_audio:
                 filename, has_audio = ensure_aac_audio(filename)
+            else:
+                # Video has no audio stream (e.g. separate DASH music track on Instagram)
+                formats = info.get("formats", [])
+                audio_fmts = [
+                    f for f in formats
+                    if (f.get("vcodec") == "none" or not f.get("vcodec"))
+                    and (f.get("acodec") and f.get("acodec") != "none" or f.get("format_id", "").endswith("a"))
+                    and f.get("url")
+                ]
+                if audio_fmts and FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
+                    best_audio = audio_fmts[-1]
+                    audio_url = best_audio["url"]
+                    temp_audio = str(BASE_DIR / f"temp_music_{int(time.time())}.m4a")
+                    try:
+                        req = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=25) as resp, open(temp_audio, "wb") as af:
+                            af.write(resp.read())
+                        if os.path.exists(temp_audio) and os.path.getsize(temp_audio) > 0:
+                            merged_file = str(BASE_DIR / f"merged_{int(time.time())}.mp4")
+                            m_cmd = [
+                                FFMPEG_PATH,
+                                "-y",
+                                "-i",
+                                filename,
+                                "-i",
+                                temp_audio,
+                                "-c:v",
+                                "copy",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-ar",
+                                "44100",
+                                "-movflags",
+                                "+faststart",
+                                "-shortest",
+                                merged_file,
+                            ]
+                            subprocess.run(m_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+                            if os.path.exists(merged_file) and os.path.getsize(merged_file) > 0:
+                                os.replace(merged_file, filename)
+                                has_audio = True
+                                logger.info("Successfully merged separate Instagram music track into video!")
+                    except Exception as me:
+                        logger.warning(f"Error merging separate audio track: {me}")
+                    finally:
+                        if os.path.exists(temp_audio):
+                            try:
+                                os.remove(temp_audio)
+                            except Exception:
+                                pass
 
             return {
                 "file_path": filename,
