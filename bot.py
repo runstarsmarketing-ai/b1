@@ -685,7 +685,7 @@ def download_media_sync(url: str, output_template: str) -> dict:
     is_instagram = "instagram.com" in target_url.lower()
 
     ydl_opts = {
-        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "format": "bestvideo+bestaudio/best[acodec!=none]/best",
         "outtmpl": output_template,
         "max_filesize": MAX_FILESIZE_BYTES,
         "quiet": True,
@@ -693,6 +693,9 @@ def download_media_sync(url: str, output_template: str) -> dict:
         "noplaylist": True,
         "writethumbnail": False,
         "merge_output_format": "mp4",
+        "postprocessor_args": {
+            "Merger": ["-c:a", "aac"],
+        },
         "remote_components": ["ejs:github"],
         "js_runtimes": {"node": {}, "deno": {}, "quickjs": {}},
         "http_headers": {
