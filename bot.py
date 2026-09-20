@@ -771,8 +771,14 @@ def download_media_sync(url: str, output_template: str) -> dict:
     target_url = resolve_redirect_url(url)
     is_instagram = "instagram.com" in target_url.lower()
 
+    format_selector = (
+        "best[ext=mp4]/best"
+        if is_instagram
+        else "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+    )
+
     ydl_opts = {
-        "format": "bestvideo+bestaudio/best",
+        "format": format_selector,
         "outtmpl": output_template,
         "max_filesize": MAX_FILESIZE_BYTES,
         "quiet": True,
@@ -849,65 +855,8 @@ def download_media_sync(url: str, output_template: str) -> dict:
                         filename = base + ext
                         break
 
-            # Verify audio stream & recover audio if silent
+            # Verify audio stream & ensure Telegram AAC compatibility
             has_audio, audio_codec = get_audio_info(filename)
-
-            if not has_audio and is_instagram:
-                # 1. Check if another format in info['formats'] has audio (e.g. progressive format 0/1/2)
-                formats = info.get("formats", [])
-                audio_candidates = [
-                    f for f in formats
-                    if f.get("url") and f.get("format_id") != info.get("format_id")
-                    and (f.get("format_id") in ["0", "1", "2"] or (f.get("acodec") and f.get("acodec") != "none"))
-                ]
-                for cand in audio_candidates:
-                    cand_url = cand.get("url")
-                    if not cand_url:
-                        continue
-                    temp_cand = str(DOWNLOADS_DIR / f"alt_cand_{int(time.time())}.mp4")
-                    try:
-                        req = urllib.request.Request(cand_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req, timeout=20) as resp, open(temp_cand, "wb") as cf:
-                            cf.write(resp.read())
-                        if os.path.exists(temp_cand) and os.path.getsize(temp_cand) > 0:
-                            cand_has_audio, cand_codec = get_audio_info(temp_cand)
-                            if cand_has_audio:
-                                os.replace(temp_cand, filename)
-                                has_audio = True
-                                audio_codec = cand_codec
-                                logger.info("Recovered Instagram video with audio from alternative format candidate!")
-                                break
-                            else:
-                                try:
-                                    os.remove(temp_cand)
-                                except Exception:
-                                    pass
-                    except Exception as ce:
-                        logger.warning(f"Error checking alternative candidate: {ce}")
-
-                # 2. Try parth_dl fallback for Instagram reels
-                if not has_audio:
-                    try:
-                        import parth_dl
-                        parth_temp = str(DOWNLOADS_DIR / f"parth_{int(time.time())}.mp4")
-                        dl = parth_dl.InstagramDownloader(verbose=False)
-                        p_paths = dl.download(target_url, output_path=parth_temp, output_mode="file")
-                        if p_paths and os.path.exists(p_paths[0]):
-                            p_has_audio, p_codec = get_audio_info(p_paths[0])
-                            if p_has_audio:
-                                os.replace(p_paths[0], filename)
-                                has_audio = True
-                                audio_codec = p_codec
-                                logger.info("Recovered Instagram video with audio from parth_dl fallback!")
-                            else:
-                                try:
-                                    os.remove(p_paths[0])
-                                except Exception:
-                                    pass
-                    except Exception as pe:
-                        logger.warning(f"parth_dl fallback error: {pe}")
-
-            # Ensure AAC audio for Telegram universal compatibility
             if has_audio:
                 filename, has_audio = ensure_telegram_compatible_audio(filename)
 
