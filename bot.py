@@ -194,6 +194,22 @@ DB_PATH = BASE_DIR / "users.db"
 
 # Max file size Telegram Bot API allows (50 MB)
 MAX_FILESIZE_BYTES = 50 * 1024 * 1024
+COOKIES_PATH = BASE_DIR / "cookies.txt"
+
+# Optional YouTube cookies from environment variable
+raw_cookies = os.getenv("YOUTUBE_COOKIES", "").strip()
+if raw_cookies:
+    try:
+        import base64
+        if not raw_cookies.startswith("# Netscape") and "\t" not in raw_cookies:
+            decoded = base64.b64decode(raw_cookies).decode("utf-8")
+            COOKIES_PATH.write_text(decoded, encoding="utf-8")
+        else:
+            COOKIES_PATH.write_text(raw_cookies, encoding="utf-8")
+        logger.info("Loaded YouTube cookies from YOUTUBE_COOKIES env var.")
+    except Exception as e:
+        logger.warning(f"Could not load cookies from YOUTUBE_COOKIES: {e}")
+
 
 # --- Database Helpers (SQLite) ---
 def init_db():
@@ -569,7 +585,7 @@ def download_media_sync(url: str, output_template: str) -> dict:
     is_instagram = "instagram.com" in target_url.lower()
 
     ydl_opts = {
-        "format": "best[ext=mp4]/bestvideo+bestaudio/best",
+        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "outtmpl": output_template,
         "max_filesize": MAX_FILESIZE_BYTES,
         "quiet": True,
@@ -581,12 +597,10 @@ def download_media_sync(url: str, output_template: str) -> dict:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         },
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios"]
-            }
-        },
     }
+
+    if COOKIES_PATH.exists() and COOKIES_PATH.stat().st_size > 0:
+        ydl_opts["cookiefile"] = str(COOKIES_PATH)
 
     if FFMPEG_PATH and os.path.exists(FFMPEG_PATH):
         ydl_opts["ffmpeg_location"] = FFMPEG_PATH
@@ -600,11 +614,31 @@ def download_media_sync(url: str, output_template: str) -> dict:
                 if is_instagram and ("no video" in err_str or "/p/" in target_url):
                     photo_path = output_template.replace("%(ext)s", "jpg")
                     return download_instagram_photo_post(target_url, photo_path)
-                if any(x in target_url.lower() for x in ["youtube.com", "youtu.be"]) and ("player" in err_str or "format" in err_str):
-                    fallback_opts = dict(ydl_opts)
-                    fallback_opts["extractor_args"] = {"youtube": {"player_client": ["mweb", "android"]}}
-                    with yt_dlp.YoutubeDL(fallback_opts) as ydl_fb:
-                        info = ydl_fb.extract_info(target_url, download=True)
+                is_yt = any(x in target_url.lower() for x in ["youtube.com", "youtu.be"])
+                if is_yt and any(term in err_str for term in ["player", "format", "sabr", "extract", "bot"]):
+                    logger.info(f"Retrying YouTube with fallback player clients: {e}")
+                    fallback_clients = [
+                        ["mweb", "android_creator", "ios"],
+                        ["tv", "android"],
+                        ["web_safari", "mweb"],
+                    ]
+                    last_yt_err = e
+                    info = None
+                    for client_set in fallback_clients:
+                        try:
+                            fb_opts = dict(ydl_opts)
+                            fb_opts["extractor_args"] = {"youtube": {"player_client": client_set}}
+                            with yt_dlp.YoutubeDL(fb_opts) as ydl_fb:
+                                info = ydl_fb.extract_info(target_url, download=True)
+                                if info:
+                                    break
+                        except Exception as fb_e:
+                            last_yt_err = fb_e
+                    if not info:
+                        if target_url != url:
+                            info = ydl.extract_info(url, download=True)
+                        else:
+                            raise last_yt_err
                 elif target_url != url:
                     info = ydl.extract_info(url, download=True)
                 else:
